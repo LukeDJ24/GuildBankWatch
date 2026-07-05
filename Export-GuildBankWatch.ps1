@@ -94,6 +94,14 @@ foreach ($file in $files) {
 			# epoch|code|player|itemID|itemName|count|copper|tab
 			$fields = (Convert-LuaEscapes $rec) -split '\|'
 			if ($fields.Count -lt 8) { continue }
+			$n = $fields.Count
+			if ($n -gt 8) {
+				# Legacy record: UI markup pipes in the item name over-split
+				# it; the name is everything between itemID and the last
+				# three fields. Strip the markup remnants afterwards.
+				$name = ($fields[4..($n - 4)] -join '|') -replace '\|A.*?\|a', '' -replace '\|T.*?\|t', '' -replace '\|', ''
+				$fields = @($fields[0..3]) + @($name.Trim()) + @($fields[($n - 3)..($n - 1)])
+			}
 			$epoch = 0L
 			if (-not [long]::TryParse($fields[0], [ref]$epoch)) { continue }
 			$code = 0

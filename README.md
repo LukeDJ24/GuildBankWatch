@@ -21,7 +21,10 @@ across sessions, with low-stock alerts and CSV export on top.
   stock falls below it.
 - **CSV export** — in-game copy-paste window, plus a PowerShell script that
   turns the saved data into a real `.csv` file.
-- **Zero idle cost** — no polling, no timers outside a bank visit; bank
+- **Live capture** — while the guild bank is open the log is re-scanned
+  every few seconds, so transactions made during the visit are recorded
+  without closing and reopening the bank.
+- **Zero idle cost** — no polling or timers outside a bank visit; bank
   events are only registered while the guild bank is open.
 
 ## Installation
@@ -48,6 +51,7 @@ automatically. Then:
 | `/gbw untrack <itemID>` | Stop tracking an item |
 | `/gbw export` | Open the CSV window (Ctrl+C to copy) |
 | `/gbw purge` | Delete this guild's recorded data |
+| `/gbw version` | Show the installed addon version |
 | `/gbw help` | List commands |
 
 Item IDs can be found on [wowhead.com](https://www.wowhead.com) (the number

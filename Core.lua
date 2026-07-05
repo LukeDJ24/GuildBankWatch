@@ -16,6 +16,7 @@ local GUILD_BANKER = (Enum and Enum.PlayerInteractionType and Enum.PlayerInterac
 local DEDUPE_TOLERANCE = 2.5 * 3600
 local STEP_TIMEOUT = 1.5
 local RESCAN_DELAY = 2
+local RESCAN_INTERVAL = 10
 local DEFAULT_RETENTION_DAYS = 60
 
 local TYPE = {
@@ -66,18 +67,29 @@ end
 -- Record format
 -------------------------------------------------------------------------------
 -- One pipe-delimited string per record: epoch|code|player|itemID|itemName|count|copper|tab
--- Pipes cannot occur in item or player names, and one-record-per-line
--- SavedVariables serialization keeps the companion script's parsing trivial.
+-- One-record-per-line SavedVariables serialization keeps the companion
+-- script's parsing trivial. Item names can carry UI escape sequences (the
+-- crafting-quality icon is an |A...|a atlas tag inside the link's bracket
+-- text) whose pipes would corrupt the record, so names are stripped of
+-- markup before encoding; DecodeRecord re-joins over-split legacy records.
 -- Numbers go through %.0f: Lua 5.1 tostring() switches to scientific notation
 -- on large doubles, which would corrupt copper amounts.
+
+local function CleanName(name)
+	if not name or name == "" then
+		return name
+	end
+	name = name:gsub("|A.-|a", ""):gsub("|T.-|t", ""):gsub("|", "")
+	return (name:gsub("^%s+", ""):gsub("%s+$", ""))
+end
 
 local function EncodeRecord(epoch, code, player, itemID, itemName, count, copper, tab)
 	return table.concat({
 		("%.0f"):format(epoch),
 		code,
-		player or "",
+		CleanName(player) or "",
 		itemID or "",
-		itemName or "",
+		CleanName(itemName) or "",
 		count or "",
 		copper and ("%.0f"):format(copper) or "",
 		tab or "",
@@ -85,9 +97,19 @@ local function EncodeRecord(epoch, code, player, itemID, itemName, count, copper
 end
 
 function ns.DecodeRecord(rec)
-	local epoch, code, player, itemID, itemName, count, copper, tab = strsplit("|", rec)
-	return tonumber(epoch), tonumber(code), player, tonumber(itemID), itemName,
-		tonumber(count), tonumber(copper), tonumber(tab)
+	local parts = { strsplit("|", rec) }
+	local n = #parts
+	local itemName, count, copper, tab
+	if n > 8 then
+		-- Legacy record: markup pipes in the item name over-split it, so the
+		-- name is everything between itemID and the last three fields.
+		itemName = table.concat(parts, "|", 5, n - 3)
+		count, copper, tab = parts[n - 2], parts[n - 1], parts[n]
+	else
+		itemName, count, copper, tab = parts[5], parts[6], parts[7], parts[8]
+	end
+	return tonumber(parts[1]), tonumber(parts[2]), parts[3], tonumber(parts[4]),
+		CleanName(itemName), tonumber(count), tonumber(copper), tonumber(tab)
 end
 
 -- Matches the client's RecentTimeDate approximation for elapsed log times.
@@ -105,6 +127,12 @@ local function Fingerprint(code, player, itemID, count, copper, tab)
 		copper and ("%.0f"):format(copper) or "",
 		tab or "",
 	}, "#")
+end
+
+-- The log reports nil for the actor until the server resolves the name
+-- (common right as the bank opens); those reads are stored as "Unknown".
+local function IsUnknownName(player)
+	return not player or player == "" or player == "Unknown"
 end
 
 -------------------------------------------------------------------------------
@@ -273,6 +301,7 @@ end
 
 local bankOpen = false
 local rescanQueued = false
+local rescanTicker
 
 local scanner = {
 	running = false,
@@ -448,31 +477,59 @@ Finalize = function(aborted)
 	local fresh = scanner.fresh
 	table.sort(fresh, function(a, b) return a.epoch < b.epoch end)
 	local newTx = {}
+	local patched = 0
 	if #fresh > 0 then
 		local minEpoch = fresh[1].epoch - DEDUPE_TOLERANCE * 2
-		local stored = {}
-		for _, rec in ipairs(g.records) do
+		local stored, unnamed = {}, {}
+		for index, rec in ipairs(g.records) do
 			local epoch, code, player, itemID, _, count, copper, tab = ns.DecodeRecord(rec)
 			if epoch and epoch >= minEpoch and code ~= TYPE.UNATTRIBUTED then
+				local entry = { epoch = epoch, used = false, index = index, player = player }
 				local fp = Fingerprint(code, player, itemID, count, copper, tab)
 				local bucket = stored[fp]
 				if not bucket then
 					bucket = {}
 					stored[fp] = bucket
 				end
-				bucket[#bucket + 1] = { epoch = epoch, used = false }
+				bucket[#bucket + 1] = entry
+				local nfp = Fingerprint(code, "", itemID, count, copper, tab)
+				bucket = unnamed[nfp]
+				if not bucket then
+					bucket = {}
+					unnamed[nfp] = bucket
+				end
+				bucket[#bucket + 1] = entry
 			end
 		end
-		for _, tx in ipairs(fresh) do
-			local bucket = stored[Fingerprint(tx.code, tx.player, tx.itemID, tx.count, tx.copper, tx.tab)]
+		local function FindBest(bucket, epoch, accept)
 			local best, bestDelta
 			if bucket then
 				for _, s in ipairs(bucket) do
-					if not s.used then
-						local delta = math.abs(s.epoch - tx.epoch)
+					if not s.used and (not accept or accept(s)) then
+						local delta = math.abs(s.epoch - epoch)
 						if delta <= DEDUPE_TOLERANCE and (not bestDelta or delta < bestDelta) then
 							best, bestDelta = s, delta
 						end
+					end
+				end
+			end
+			return best
+		end
+		for _, tx in ipairs(fresh) do
+			local best = FindBest(stored[Fingerprint(tx.code, tx.player, tx.itemID, tx.count, tx.copper, tx.tab)], tx.epoch)
+			if not best then
+				-- The same transaction can be read with and without the
+				-- actor's name resolved. Match across that difference so it
+				-- is not duplicated, and back-fill the name once known.
+				local nameless = unnamed[Fingerprint(tx.code, "", tx.itemID, tx.count, tx.copper, tx.tab)]
+				if IsUnknownName(tx.player) then
+					best = FindBest(nameless, tx.epoch)
+				else
+					best = FindBest(nameless, tx.epoch, function(s) return IsUnknownName(s.player) end)
+					if best then
+						local epoch, code, _, itemID, itemName, count, copper, tab = ns.DecodeRecord(g.records[best.index])
+						g.records[best.index] = EncodeRecord(epoch, code, tx.player, itemID, itemName, count, copper, tab)
+						patched = patched + 1
 					end
 				end
 			end
@@ -540,16 +597,36 @@ Finalize = function(aborted)
 				ns.WarnLowStock(g, itemID, have, minCount)
 			end
 		end
-	else
-		-- Partial data: drop the baseline so the next complete scan starts
-		-- clean instead of producing phantom gap warnings.
+	elseif #newTx > 0 then
+		-- Partial data with new records: the old baseline no longer explains
+		-- the bank's contents, so drop it rather than risk phantom gap
+		-- warnings. A partial scan that found nothing new keeps the baseline.
 		g.snapshot = nil
 	end
 
 	if #newTx > 0 then
 		ns.Print("Recorded %d new guild bank transaction(s).", #newTx)
 	end
+	if patched > 0 then
+		ns.Print("Resolved the character name on %d earlier record(s).", patched)
+	end
 	if ns.RefreshUI then ns.RefreshUI() end
+end
+
+-- Log or bag activity while the bank sits open (e.g. the user's own
+-- withdrawal): pick it up with one short-delay rescan.
+local function QueueRescan()
+	if not bankOpen or scanner.running or rescanQueued
+		or GetTime() - (scanner.lastFinish or 0) <= 1 then
+		return
+	end
+	rescanQueued = true
+	C_Timer.After(RESCAN_DELAY, function()
+		rescanQueued = false
+		if bankOpen then
+			StartScan()
+		end
+	end)
 end
 
 -------------------------------------------------------------------------------
@@ -571,10 +648,24 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
 			self:RegisterEvent("GUILDBANKBAGSLOTS_CHANGED")
 			-- Small delay lets the default UI's own queries settle first.
 			C_Timer.After(0.6, StartScan)
+			-- The server does not push other players' log activity to an
+			-- open client, so poll while (and only while) the bank is open.
+			if rescanTicker then
+				rescanTicker:Cancel()
+			end
+			rescanTicker = C_Timer.NewTicker(RESCAN_INTERVAL, function()
+				if bankOpen and not scanner.running then
+					StartScan()
+				end
+			end)
 		end
 	elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
 		if arg1 == GUILD_BANKER and bankOpen then
 			bankOpen = false
+			if rescanTicker then
+				rescanTicker:Cancel()
+				rescanTicker = nil
+			end
 			self:UnregisterEvent("GUILDBANKLOG_UPDATE")
 			self:UnregisterEvent("GUILDBANKBAGSLOTS_CHANGED")
 			if scanner.running then
@@ -588,17 +679,8 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
 			ReadStep(step)
 			scanner.waiting = nil
 			FinishStep()
-		elseif bankOpen and not scanner.running and not rescanQueued
-			and GetTime() - (scanner.lastFinish or 0) > 1 then
-			-- Log activity while the bank sits open (e.g. the user's own
-			-- withdrawal): pick it up with one delayed rescan.
-			rescanQueued = true
-			C_Timer.After(RESCAN_DELAY, function()
-				rescanQueued = false
-				if bankOpen then
-					StartScan()
-				end
-			end)
+		else
+			QueueRescan()
 		end
 	elseif event == "GUILDBANKBAGSLOTS_CHANGED" then
 		local step = scanner.waiting
@@ -613,6 +695,8 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
 					FinishStep()
 				end
 			end)
+		else
+			QueueRescan()
 		end
 	elseif event == "ADDON_LOADED" then
 		if arg1 == ADDON_NAME then

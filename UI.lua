@@ -703,6 +703,10 @@ SlashCmdList.GUILDBANKWATCH = function(msg)
 		ns.RemoveWatch(rest:match("^(%d+)"))
 	elseif lower == "purge" then
 		StaticPopup_Show("GBW_CONFIRM_PURGE")
+	elseif lower == "version" then
+		local version = (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON_NAME, "Version"))
+			or (GetAddOnMetadata and GetAddOnMetadata(ADDON_NAME, "Version"))
+		ns.Print("Version %s", version or "unknown")
 	elseif lower == "help" or lower == "?" then
 		ns.Print("Commands:")
 		ns.Print("  /gbw — toggle the window")
@@ -711,6 +715,7 @@ SlashCmdList.GUILDBANKWATCH = function(msg)
 		ns.Print("  /gbw untrack <itemID> — stop watching an item")
 		ns.Print("  /gbw export — open the CSV export window")
 		ns.Print("  /gbw purge — delete this guild's recorded data")
+		ns.Print("  /gbw version — show the installed addon version")
 	else
 		ns.ToggleWindow(msg)
 	end
