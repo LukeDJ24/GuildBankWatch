@@ -1,4 +1,4 @@
-## Interface: 120007
+## Interface: 120100
 ## Title: GuildBankWatch
 ## Notes: Tracks who takes items and gold from the guild bank, with low-stock alerts, shareable watchlists, and CSV export.
 ## Author: Dev

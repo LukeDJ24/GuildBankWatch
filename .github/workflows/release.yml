@@ -29,7 +29,10 @@ jobs:
         run: |
           set -euo pipefail
           version=$(sed -n 's/^## Version:[[:space:]]*//p' GuildBankWatch.toc | tr -d '\r')
-          interface=$(sed -n 's/^## Interface:[[:space:]]*//p' GuildBankWatch.toc | tr -d '\r')
+          # A .toc may list several interface versions ("120100, 120007");
+          # release.json takes a single number, so use the first.
+          interface=$(sed -n 's/^## Interface:[[:space:]]*//p' GuildBankWatch.toc |
+            tr -d '\r' | cut -d, -f1 | tr -d '[:space:]')
           if [ -z "$version" ] || [ -z "$interface" ]; then
             echo "::error::Could not read '## Version:' / '## Interface:' from GuildBankWatch.toc"
             exit 1
@@ -46,6 +49,9 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Built with Python's stdlib rather than the zip/jq binaries: those are
+      # not guaranteed on the runner image, and a silent failure there
+      # produces an empty release rather than an obvious error.
       - name: Build package
         if: steps.meta.outputs.skip == 'false'
         env:
@@ -53,17 +59,34 @@ jobs:
           INTERFACE: ${{ steps.meta.outputs.interface }}
         run: |
           set -euo pipefail
-          # The zip must contain the addon folder at its root, and WowUp
-          # requires that folder to be named after the repository.
-          mkdir -p build/GuildBankWatch
-          cp GuildBankWatch.toc Core.lua UI.lua README.md build/GuildBankWatch/
-          (cd build && zip -rq "../$ZIP" GuildBankWatch)
-          unzip -l "$ZIP"
+          python3 - <<'PY'
+          import json, os, zipfile
+
+          zip_name = os.environ["ZIP"]
+          interface = int(os.environ["INTERFACE"])
+          # WowUp installs whatever folders it finds at the zip root, and
+          # requires the folder to be named after the repository.
+          folder = "GuildBankWatch"
+          files = ["GuildBankWatch.toc", "Core.lua", "UI.lua", "README.md"]
+
+          with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+              for name in files:
+                  z.write(name, "%s/%s" % (folder, name))
+
           # release.json is how WowUp prefers to learn the game flavour;
-          # without it, it falls back to guessing from the filename.
-          jq -n --arg filename "$ZIP" --argjson interface "$INTERFACE" \
-            '{releases:[{filename:$filename,nolib:false,metadata:[{flavor:"mainline",interface:$interface}]}]}' \
-            > release.json
+          # without it it falls back to guessing from the filename.
+          meta = {"releases": [{"filename": zip_name, "nolib": False,
+                  "metadata": [{"flavor": "mainline", "interface": interface}]}]}
+          with open("release.json", "w") as handle:
+              json.dump(meta, handle, indent=2)
+
+          print("packaged %s" % zip_name)
+          for name in sorted(zipfile.ZipFile(zip_name).namelist()):
+              print("   ", name)
+          PY
+          # Fail loudly here rather than publishing an empty release.
+          test -s "$ZIP" || { echo "::error::$ZIP was not created"; exit 1; }
+          test -s release.json || { echo "::error::release.json was not created"; exit 1; }
 
       - name: Publish release
         if: steps.meta.outputs.skip == 'false'
