@@ -1,0 +1,79 @@
+name: Release
+
+# Releases are driven by the addon's own version number: bump "## Version:"
+# in GuildBankWatch.toc and push to main, and this builds the zip WowUp needs
+# and publishes it. Pushes that leave the version alone are ignored, so
+# ordinary commits cost nothing and never produce a spurious update prompt.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.lua"
+      - "**.toc"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read addon metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^## Version:[[:space:]]*//p' GuildBankWatch.toc | tr -d '\r')
+          interface=$(sed -n 's/^## Interface:[[:space:]]*//p' GuildBankWatch.toc | tr -d '\r')
+          if [ -z "$version" ] || [ -z "$interface" ]; then
+            echo "::error::Could not read '## Version:' / '## Interface:' from GuildBankWatch.toc"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "interface=$interface" >> "$GITHUB_OUTPUT"
+          # WowUp reports the asset filename as the installed version, so the
+          # filename has to change every release or clients see no update.
+          echo "zip=GuildBankWatch-$version.zip" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "::notice::Release v$version already exists. Bump '## Version:' in GuildBankWatch.toc to publish a new one."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build package
+        if: steps.meta.outputs.skip == 'false'
+        env:
+          ZIP: ${{ steps.meta.outputs.zip }}
+          INTERFACE: ${{ steps.meta.outputs.interface }}
+        run: |
+          set -euo pipefail
+          # The zip must contain the addon folder at its root, and WowUp
+          # requires that folder to be named after the repository.
+          mkdir -p build/GuildBankWatch
+          cp GuildBankWatch.toc Core.lua UI.lua README.md build/GuildBankWatch/
+          (cd build && zip -rq "../$ZIP" GuildBankWatch)
+          unzip -l "$ZIP"
+          # release.json is how WowUp prefers to learn the game flavour;
+          # without it, it falls back to guessing from the filename.
+          jq -n --arg filename "$ZIP" --argjson interface "$INTERFACE" \
+            '{releases:[{filename:$filename,nolib:false,metadata:[{flavor:"mainline",interface:$interface}]}]}' \
+            > release.json
+
+      - name: Publish release
+        if: steps.meta.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" \
+            --title "GuildBankWatch $VERSION" \
+            --generate-notes \
+            "$ZIP" release.json

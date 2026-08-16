@@ -1,11 +1,14 @@
 -- GuildBankWatch UI: lazily created window (Log / Totals / Watchlist views),
--- CSV export dialog, and slash commands. No frames are allocated until the
--- window is first opened.
+-- CSV export, watchlist share/import dialogs, and slash commands. No frames
+-- are allocated until the window is first opened.
 
 local ADDON_NAME, ns = ...
 local TYPE = ns.TYPE
 
-local window, exportFrame
+local window, exportFrame, shareFrame, importFrame
+local importItems -- parsed contents of the import box, nil until it validates
+local editingWatchRow -- minimum box currently being typed into, if any
+local refreshing = false
 local logView, totalsView, watchView
 local logBox, totalsBox, watchBox
 local nameBox, idBox, minBox
@@ -76,6 +79,15 @@ local function ColorName(name)
 		return ("|c%s%s|r"):format(color.colorStr, name)
 	end
 	return name
+end
+
+local function SetActionTooltip(widget, text)
+	widget:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_TOP")
+		GameTooltip:SetText(text, nil, nil, nil, nil, true)
+		GameTooltip:Show()
+	end)
+	widget:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
 
 local function AddHeader(parent, text, x, y)
@@ -281,6 +293,27 @@ local function InitTotalsRow(row, data)
 	row.goldInText:SetText(data.goldIn > 0 and MoneyText(data.goldIn) or "-")
 end
 
+-- Applies whatever is in a row's minimum box, or puts the stored value back
+-- if it is not usable.
+local function CommitWatchMin(box)
+	local row = box:GetParent()
+	local typed = box:GetText() or ""
+	local value = tonumber(typed)
+	if box.cancelled or not value or value < 1 then
+		if not box.cancelled and typed ~= "" then
+			ns.Print("Minimum must be a whole number of 1 or more.")
+		end
+		box.cancelled = nil
+		box:SetText(tostring(row.currentMin or ""))
+		return
+	end
+	value = math.floor(value)
+	if row.itemID and value ~= row.currentMin then
+		row.currentMin = value -- set first, so a redraw cannot re-apply it
+		ns.SetWatchMinimum(row.itemID, value)
+	end
+end
+
 local function InitWatchRow(row, data)
 	if not row.icon then
 		row.icon = row:CreateTexture(nil, "ARTWORK")
@@ -288,12 +321,42 @@ local function InitWatchRow(row, data)
 		row.icon:SetPoint("LEFT", 6, 0)
 		row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 		row.nameText:SetPoint("LEFT", 32, 0)
-		row.nameText:SetWidth(316)
+		row.nameText:SetWidth(310)
 		row.nameText:SetJustifyH("LEFT")
-		row.countText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-		row.countText:SetPoint("LEFT", 356, 0)
-		row.countText:SetWidth(180)
-		row.countText:SetJustifyH("LEFT")
+		row.haveText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		row.haveText:SetPoint("LEFT", 352, 0)
+		row.haveText:SetWidth(48)
+		row.haveText:SetJustifyH("LEFT")
+		row.slashText = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+		row.slashText:SetPoint("LEFT", 404, 0)
+		row.slashText:SetText("/")
+		row.minBox = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
+		row.minBox:SetSize(46, 20)
+		row.minBox:SetPoint("LEFT", 418, 0)
+		row.minBox:SetAutoFocus(false)
+		row.minBox:SetNumeric(true)
+		row.minBox:SetMaxLetters(6)
+		row.minBox:SetJustifyH("CENTER")
+		row.minBox:SetScript("OnEditFocusGained", function(self)
+			editingWatchRow = self
+			self:HighlightText()
+		end)
+		row.minBox:SetScript("OnEditFocusLost", function(self)
+			if editingWatchRow == self then
+				editingWatchRow = nil
+			end
+			CommitWatchMin(self)
+		end)
+		row.minBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+		row.minBox:SetScript("OnEscapePressed", function(self)
+			self.cancelled = true
+			self:ClearFocus()
+		end)
+		SetActionTooltip(row.minBox, "Type a new minimum and press Enter. Escape cancels.")
+		row.flagText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		row.flagText:SetPoint("LEFT", 474, 0)
+		row.flagText:SetWidth(130)
+		row.flagText:SetJustifyH("LEFT")
 		row.remove = CreateFrame("Button", nil, row, "UIPanelCloseButton")
 		row.remove:SetSize(20, 20)
 		row.remove:SetPoint("RIGHT", -6, 0)
@@ -301,7 +364,14 @@ local function InitWatchRow(row, data)
 			ns.RemoveWatch(btn:GetParent().itemID)
 		end)
 	end
+	-- Scrolling can hand this recycled frame to a different item mid-edit, so
+	-- commit first, while row.itemID still points at the one being edited.
+	if row.minBox:HasFocus() then
+		row.minBox:ClearFocus()
+	end
 	row.itemID = data.itemID
+	row.currentMin = data.min
+	row.minBox:SetText(tostring(data.min))
 	local icon = C_Item.GetItemIconByID and C_Item.GetItemIconByID(data.itemID)
 	row.icon:SetTexture(icon or 134400) -- question mark icon fallback
 	local name = data.name
@@ -323,11 +393,14 @@ local function InitWatchRow(row, data)
 	end
 	row.nameText:SetText(name)
 	if data.have == nil then
-		row.countText:SetText("|cff888888? / " .. data.min .. " (no bank scan yet)|r")
+		row.haveText:SetText("|cff888888?|r")
+		row.flagText:SetText("|cff888888no bank scan yet|r")
 	elseif data.have < data.min then
-		row.countText:SetText(("|cffff5555%d / %d — low!|r"):format(data.have, data.min))
+		row.haveText:SetText(("|cffff5555%d|r"):format(data.have))
+		row.flagText:SetText("|cffff5555low!|r")
 	else
-		row.countText:SetText(("|cff55ff55%d / %d|r"):format(data.have, data.min))
+		row.haveText:SetText(("|cff55ff55%d|r"):format(data.have))
+		row.flagText:SetText("")
 	end
 end
 
@@ -394,7 +467,8 @@ local function CreateWatchView(content)
 	watchView = CreateFrame("Frame", nil, content)
 	watchView:SetAllPoints()
 	AddHeader(watchView, "Tracked item", 32, 0)
-	AddHeader(watchView, "In bank / Minimum", 356, 0)
+	AddHeader(watchView, "In bank", 352, 0)
+	AddHeader(watchView, "Minimum", 420, 0)
 
 	local listFrame = CreateFrame("Frame", nil, watchView)
 	listFrame:SetPoint("TOPLEFT", 0, -16)
@@ -438,9 +512,23 @@ local function CreateWatchView(content)
 	idBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 	minBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
+	local importButton = CreateFrame("Button", nil, watchView, "UIPanelButtonTemplate")
+	importButton:SetSize(70, 22)
+	importButton:SetPoint("BOTTOMRIGHT", -2, 12)
+	importButton:SetText("Import")
+	importButton:SetScript("OnClick", function() ns.OpenWatchImport() end)
+
+	local shareButton = CreateFrame("Button", nil, watchView, "UIPanelButtonTemplate")
+	shareButton:SetSize(70, 22)
+	shareButton:SetPoint("RIGHT", importButton, "LEFT", -6, 0)
+	shareButton:SetText("Export")
+	shareButton:SetScript("OnClick", function() ns.OpenWatchExport() end)
+
 	local hint = watchView:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	hint:SetPoint("LEFT", addButton, "RIGHT", 14, 0)
-	hint:SetText("Type an item ID from wowhead.com, or shift-click an item link.")
+	hint:SetPoint("RIGHT", shareButton, "LEFT", -10, 0)
+	hint:SetJustifyH("LEFT")
+	hint:SetText("IDs come from wowhead.com.")
 
 	-- Shift-clicked item links land in the ID box while this view is open.
 	if type(ChatEdit_InsertLink) == "function" then
@@ -460,9 +548,12 @@ end
 -------------------------------------------------------------------------------
 
 Refresh = function()
-	if not window or not window:IsShown() then
+	-- The re-entrancy guard matters because committing an edited minimum can
+	-- trigger a refresh from inside the list's own row initializer.
+	if not window or not window:IsShown() or refreshing then
 		return
 	end
+	refreshing = true
 	if currentView == "log" and logBox then
 		local list = BuildLogList()
 		SetListData(logBox, list)
@@ -471,11 +562,14 @@ Refresh = function()
 		local list = BuildTotalsList()
 		SetListData(totalsBox, list)
 		totalsView.empty:SetShown(#list == 0)
-	elseif currentView == "watch" and watchBox then
+	elseif currentView == "watch" and watchBox and not editingWatchRow then
+		-- Skipped while a minimum is being typed, so a background bank scan
+		-- cannot reset the value under the cursor.
 		local list = BuildWatchList()
 		SetListData(watchBox, list)
 		watchView.empty:SetShown(#list == 0)
 	end
+	refreshing = false
 end
 
 ns.RefreshUI = function()
@@ -615,43 +709,47 @@ function ns.BuildCSV(g)
 	return table.concat(rows, "\n")
 end
 
-local function GetExportFrame()
-	if exportFrame then
-		return exportFrame
-	end
-	exportFrame = CreateFrame("Frame", "GuildBankWatchExportFrame", UIParent, "BasicFrameTemplateWithInset")
-	exportFrame:SetSize(560, 420)
-	exportFrame:SetPoint("CENTER")
-	exportFrame:SetFrameStrata("DIALOG")
-	exportFrame:SetMovable(true)
-	exportFrame:EnableMouse(true)
-	exportFrame:RegisterForDrag("LeftButton")
-	exportFrame:SetScript("OnDragStart", exportFrame.StartMoving)
-	exportFrame:SetScript("OnDragStop", exportFrame.StopMovingOrSizing)
-	exportFrame:SetClampedToScreen(true)
-	exportFrame:Hide()
-	tinsert(UISpecialFrames, "GuildBankWatchExportFrame")
+-------------------------------------------------------------------------------
+-- Copy-paste dialogs
+-------------------------------------------------------------------------------
 
-	if exportFrame.TitleText then
-		exportFrame.TitleText:SetText("GuildBankWatch — CSV Export")
-	end
-	local hint = exportFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	hint:SetPoint("TOP", 0, -28)
-	hint:SetText("Press Ctrl+C to copy, then paste into a spreadsheet.")
+-- Shared shell for the three text windows: a movable frame around a scrolling
+-- multi-line edit box. Callers re-anchor .scroll when they need room for
+-- controls along the bottom.
+local function CreateTextDialog(globalName, title, width, height)
+	local f = CreateFrame("Frame", globalName, UIParent, "BasicFrameTemplateWithInset")
+	f:SetSize(width, height)
+	f:SetPoint("CENTER")
+	f:SetFrameStrata("DIALOG")
+	f:SetMovable(true)
+	f:EnableMouse(true)
+	f:RegisterForDrag("LeftButton")
+	f:SetScript("OnDragStart", f.StartMoving)
+	f:SetScript("OnDragStop", f.StopMovingOrSizing)
+	f:SetClampedToScreen(true)
+	f:Hide()
+	tinsert(UISpecialFrames, globalName)
 
-	local scroll = CreateFrame("ScrollFrame", nil, exportFrame, "UIPanelScrollFrameTemplate")
+	if f.TitleText then
+		f.TitleText:SetText(title)
+	end
+	f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	f.hint:SetPoint("TOP", 0, -28)
+
+	local scroll = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
 	scroll:SetPoint("TOPLEFT", 14, -46)
 	scroll:SetPoint("BOTTOMRIGHT", -32, 14)
 	local editBox = CreateFrame("EditBox", nil, scroll)
 	editBox:SetMultiLine(true)
 	editBox:SetFontObject(ChatFontNormal)
-	editBox:SetWidth(500)
+	editBox:SetWidth(width - 60)
 	editBox:SetAutoFocus(false)
 	editBox:SetMaxLetters(0)
-	editBox:SetScript("OnEscapePressed", function() exportFrame:Hide() end)
+	editBox:SetScript("OnEscapePressed", function() f:Hide() end)
 	scroll:SetScrollChild(editBox)
-	exportFrame.editBox = editBox
-	return exportFrame
+	f.scroll = scroll
+	f.editBox = editBox
+	return f
 end
 
 function ns.OpenExport()
@@ -660,11 +758,151 @@ function ns.OpenExport()
 		ns.Print("Nothing recorded yet for this guild — visit the guild bank first.")
 		return
 	end
-	local f = GetExportFrame()
-	f.editBox:SetText(ns.BuildCSV(g))
-	f:Show()
-	f.editBox:SetFocus()
-	f.editBox:HighlightText()
+	if not exportFrame then
+		exportFrame = CreateTextDialog("GuildBankWatchExportFrame", "GuildBankWatch — CSV Export", 560, 420)
+		exportFrame.hint:SetText("Press Ctrl+C to copy, then paste into a spreadsheet.")
+	end
+	exportFrame.editBox:SetText(ns.BuildCSV(g))
+	exportFrame:Show()
+	exportFrame.editBox:SetFocus()
+	exportFrame.editBox:HighlightText()
+end
+
+-------------------------------------------------------------------------------
+-- Watchlist share / import
+-------------------------------------------------------------------------------
+
+function ns.OpenWatchExport()
+	local text, info = ns.ExportWatchString()
+	if not text then
+		if info == "noguild" then
+			ns.Print("You are not in a guild.")
+		else
+			ns.Print("No tracked items to export — add one from the Watchlist view first.")
+		end
+		return
+	end
+	if not shareFrame then
+		shareFrame = CreateTextDialog("GuildBankWatchShareFrame", "GuildBankWatch — Export Tracked Items", 560, 250)
+	end
+	shareFrame.hint:SetText(("%d tracked item(s) — press Ctrl+C to copy, then share the string."):format(info))
+	shareFrame.editBox:SetText(text)
+	shareFrame:Show()
+	shareFrame.editBox:SetFocus()
+	shareFrame.editBox:HighlightText()
+end
+
+-- How many currently tracked items a "replace" would drop: everything tracked
+-- now that the pasted string does not mention.
+local function ReplaceDropCount(summary)
+	return summary.existing - (summary.changed + summary.same)
+end
+
+local function UpdateImportPreview()
+	local items, reason = ns.ParseWatchString(importFrame.editBox:GetText())
+	importItems = items
+	importFrame.merge:SetEnabled(items ~= nil)
+	importFrame.replace:SetEnabled(items ~= nil)
+	if not items then
+		if reason == "empty" then
+			importFrame.status:SetText("|cff888888Paste a string above to see what it contains.|r")
+		elseif reason == "corrupt" then
+			importFrame.status:SetText("|cffff5555That string is incomplete or damaged — copy the whole thing and try again.|r")
+		else
+			importFrame.status:SetText("|cffff5555That does not look like a GuildBankWatch item string.|r")
+		end
+		return
+	end
+	local summary = ns.SummarizeWatchImport(items)
+	local lines = {
+		("|cffffffff%d item(s)|r in this string: %d new, %d with a different minimum, %d already tracked as-is.")
+			:format(#items, summary.new, summary.changed, summary.same),
+	}
+	if summary.unknown > 0 then
+		lines[#lines + 1] = ("|cffff9933%d item ID(s) are unknown to this client and will be skipped.|r")
+			:format(summary.unknown)
+	end
+	local drops = ReplaceDropCount(summary)
+	if drops > 0 then
+		lines[#lines + 1] = ("|cffffcc00Replace would remove %d tracked item(s) missing from this string.|r"):format(drops)
+	end
+	importFrame.status:SetText(table.concat(lines, "\n"))
+end
+
+local function ApplyImport(mode)
+	if not importItems then
+		return
+	end
+	local result = ns.ApplyWatchImport(importItems, mode)
+	if not result then
+		return
+	end
+	local parts = { ("%d added"):format(result.added), ("%d updated"):format(result.updated) }
+	if result.removed > 0 then
+		parts[#parts + 1] = ("%d removed"):format(result.removed)
+	end
+	if result.skipped > 0 then
+		parts[#parts + 1] = ("%d skipped"):format(result.skipped)
+	end
+	ns.Print("Import complete: %s.", table.concat(parts, ", "))
+	importFrame:Hide()
+	Refresh()
+end
+
+StaticPopupDialogs["GBW_CONFIRM_IMPORT_REPLACE"] = {
+	text = "Replace this guild's tracked items with the imported list?\n\n%d item(s) you track now are missing from the string and will be removed.",
+	button1 = YES,
+	button2 = NO,
+	OnAccept = function() ApplyImport("replace") end,
+	timeout = 0,
+	whileDead = true,
+	hideOnEscape = true,
+	preferredIndex = 3,
+}
+
+function ns.OpenWatchImport()
+	if not importFrame then
+		importFrame = CreateTextDialog("GuildBankWatchImportFrame", "GuildBankWatch — Import Tracked Items", 560, 300)
+		importFrame.hint:SetText("Paste a GuildBankWatch item string below, then choose how to apply it.")
+		importFrame.scroll:SetPoint("BOTTOMRIGHT", -32, 76)
+
+		importFrame.status = importFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		importFrame.status:SetPoint("BOTTOMLEFT", 16, 46)
+		importFrame.status:SetPoint("BOTTOMRIGHT", -16, 46)
+		importFrame.status:SetJustifyH("LEFT")
+
+		importFrame.merge = CreateFrame("Button", nil, importFrame, "UIPanelButtonTemplate")
+		importFrame.merge:SetSize(150, 22)
+		importFrame.merge:SetPoint("BOTTOMLEFT", 16, 14)
+		importFrame.merge:SetText("Merge into list")
+		importFrame.merge:SetScript("OnClick", function() ApplyImport("merge") end)
+		SetActionTooltip(importFrame.merge,
+			"Adds the imported items and keeps everything you already track. Where an item appears in both, the imported minimum wins.")
+
+		importFrame.replace = CreateFrame("Button", nil, importFrame, "UIPanelButtonTemplate")
+		importFrame.replace:SetSize(150, 22)
+		importFrame.replace:SetPoint("LEFT", importFrame.merge, "RIGHT", 8, 0)
+		importFrame.replace:SetText("Replace list")
+		importFrame.replace:SetScript("OnClick", function()
+			if not importItems then
+				return
+			end
+			local drops = ReplaceDropCount(ns.SummarizeWatchImport(importItems))
+			if drops > 0 then
+				StaticPopup_Show("GBW_CONFIRM_IMPORT_REPLACE", drops)
+			else
+				ApplyImport("replace")
+			end
+		end)
+		SetActionTooltip(importFrame.replace,
+			"Makes this guild's watchlist an exact copy of the string. Items you track that are missing from it are removed.")
+
+		importFrame.editBox:SetScript("OnTextChanged", UpdateImportPreview)
+	end
+	importFrame.editBox:SetText("")
+	UpdateImportPreview()
+	importFrame:Show()
+	importFrame.editBox:SetFocus()
 end
 
 -------------------------------------------------------------------------------
@@ -691,7 +929,14 @@ SlashCmdList.GUILDBANKWATCH = function(msg)
 	if lower == "" then
 		ns.ToggleWindow()
 	elseif lower == "export" then
-		ns.OpenExport()
+		local what = rest:lower()
+		if what == "items" or what == "list" or what == "watchlist" then
+			ns.OpenWatchExport()
+		else
+			ns.OpenExport()
+		end
+	elseif lower == "import" then
+		ns.OpenWatchImport()
 	elseif lower == "track" then
 		local id, minCount = rest:match("^(%d+)%s*(%d*)$")
 		if id then
@@ -714,6 +959,8 @@ SlashCmdList.GUILDBANKWATCH = function(msg)
 		ns.Print("  /gbw track <itemID> [minimum] — watch an item for low stock")
 		ns.Print("  /gbw untrack <itemID> — stop watching an item")
 		ns.Print("  /gbw export — open the CSV export window")
+		ns.Print("  /gbw export items — copy your tracked items as a shareable string")
+		ns.Print("  /gbw import — paste a shared tracked-items string")
 		ns.Print("  /gbw purge — delete this guild's recorded data")
 		ns.Print("  /gbw version — show the installed addon version")
 	else

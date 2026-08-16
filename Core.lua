@@ -1,5 +1,5 @@
 -- GuildBankWatch Core: guild bank log scanning, count-aware deduplication,
--- persistence, gap detection, and the low-stock watchlist.
+-- persistence, gap detection, the low-stock watchlist, and watchlist sharing.
 --
 -- Zero idle cost by design: outside a guild bank session only the two
 -- PLAYER_INTERACTION_MANAGER events are registered (plus two one-shot
@@ -251,15 +251,57 @@ function ns.AddWatch(itemID, minCount)
 		ns.Print("You are not in a guild.")
 		return
 	end
+	local previous = g.watch[itemID]
 	g.watch[itemID] = minCount
+	if previous ~= minCount then
+		-- A raised threshold can put the item under it, so let the warning
+		-- fire again this session instead of staying silent.
+		sessionWarned[itemID] = nil
+	end
 	local item = Item:CreateFromItemID(itemID)
 	item:ContinueOnItemLoad(function()
 		g.watchNames = g.watchNames or {}
 		g.watchNames[itemID] = item:GetItemName()
-		ns.Print("Now tracking %s — warns when the bank holds fewer than %d.",
-			item:GetItemLink() or item:GetItemName() or ("item " .. itemID), minCount)
+		local display = item:GetItemLink() or item:GetItemName() or ("item " .. itemID)
+		if previous == minCount then
+			ns.Print("Already tracking %s with a minimum of %d.", display, minCount)
+		elseif previous then
+			ns.Print("%s minimum changed from %d to %d.", display, previous, minCount)
+		else
+			ns.Print("Now tracking %s — warns when the bank holds fewer than %d.", display, minCount)
+		end
 		if ns.RefreshUI then ns.RefreshUI() end
 	end)
+end
+
+-- Adjusts the threshold on an item that is already tracked, leaving the rest
+-- of the watchlist alone. Returns true when the stored value actually changed.
+function ns.SetWatchMinimum(itemID, minCount)
+	itemID, minCount = tonumber(itemID), tonumber(minCount)
+	local g = itemID and ns.GetGuildData(false)
+	if not g or not g.watch or not g.watch[itemID] then
+		ns.Print("Not tracking item ID %s — add it first.", tostring(itemID or "?"))
+		return false
+	end
+	if not minCount or minCount < 1 then
+		ns.Print("Minimum must be a whole number of 1 or more.")
+		return false
+	end
+	minCount = math.floor(minCount)
+	if g.watch[itemID] == minCount then
+		return false
+	end
+	g.watch[itemID] = minCount
+	sessionWarned[itemID] = nil
+	local display = (g.watchNames and g.watchNames[itemID]) or ("item " .. itemID)
+	local have = g.snapshot and g.snapshot.totals and g.snapshot.totals[itemID]
+	if have then
+		ns.Print("%s minimum is now %d (%d in the bank as of the last visit).", display, minCount, have)
+	else
+		ns.Print("%s minimum is now %d.", display, minCount)
+	end
+	if ns.RefreshUI then ns.RefreshUI() end
+	return true
 end
 
 function ns.RemoveWatch(itemID)
@@ -290,6 +332,216 @@ local function LoginChecks()
 			ns.WarnLowStock(g, itemID, have, minCount, g.snapshot.time)
 		end
 	end
+end
+
+-------------------------------------------------------------------------------
+-- Watchlist sharing
+-------------------------------------------------------------------------------
+-- Tracked items travel as one copy-paste string: "GBW1:<checksum>:<base64>".
+-- The payload carries item IDs and their minimums and nothing else — no
+-- character, guild, or transaction data — so a shared string says only "here
+-- are the items I track". Item names are deliberately excluded too: they are
+-- locale-specific, so the importing client resolves them from the ID instead.
+--
+-- Base64 keeps the string to the character set that survives a trip through
+-- chat, Discord, and the in-game edit box. The checksum catches the common
+-- failure of a paste that was truncated on the way.
+
+local SHARE_PREFIX = "GBW1"
+local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64_INDEX = {}
+for i = 1, #B64_CHARS do
+	B64_INDEX[B64_CHARS:sub(i, i)] = i - 1
+end
+
+-- Arithmetic rather than bit ops: values stay far below 2^53, so doubles hold
+-- them exactly and the addon keeps working if the bit library ever moves.
+local function Base64Encode(data)
+	local out = {}
+	for i = 1, #data, 3 do
+		local a, b, c = data:byte(i, i + 2)
+		local n = a * 65536 + (b or 0) * 256 + (c or 0)
+		local c1 = math.floor(n / 262144) % 64
+		local c2 = math.floor(n / 4096) % 64
+		local c3 = math.floor(n / 64) % 64
+		local c4 = n % 64
+		out[#out + 1] = B64_CHARS:sub(c1 + 1, c1 + 1)
+			.. B64_CHARS:sub(c2 + 1, c2 + 1)
+			.. (b and B64_CHARS:sub(c3 + 1, c3 + 1) or "=")
+			.. (c and B64_CHARS:sub(c4 + 1, c4 + 1) or "=")
+	end
+	return table.concat(out)
+end
+
+local function Base64Decode(text)
+	text = text:gsub("[^A-Za-z0-9+/]", "")
+	local out = {}
+	for i = 1, #text, 4 do
+		local c1, c2 = B64_INDEX[text:sub(i, i)], B64_INDEX[text:sub(i + 1, i + 1)]
+		if not c1 or not c2 then
+			return nil -- a lone trailing character cannot encode a byte
+		end
+		local c3, c4 = B64_INDEX[text:sub(i + 2, i + 2)], B64_INDEX[text:sub(i + 3, i + 3)]
+		local n = c1 * 262144 + c2 * 4096 + (c3 or 0) * 64 + (c4 or 0)
+		out[#out + 1] = string.char(math.floor(n / 65536) % 256)
+		if c3 then
+			out[#out + 1] = string.char(math.floor(n / 256) % 256)
+		end
+		if c4 then
+			out[#out + 1] = string.char(n % 256)
+		end
+	end
+	return table.concat(out)
+end
+
+-- djb2 folded to 31 bits: still far more than enough to catch a truncated
+-- paste, and small enough that "%x" is safe on any Lua integer width.
+local function Checksum(s)
+	local sum = 5381
+	for i = 1, #s do
+		sum = (sum * 33 + s:byte(i)) % 2147483648
+	end
+	return sum
+end
+
+-- Returns the share string and the item count, or nil plus a reason
+-- ("noguild" or "empty").
+function ns.ExportWatchString()
+	local g = ns.GetGuildData(false)
+	if not g then
+		return nil, "noguild"
+	end
+	local ids = {}
+	for itemID in pairs(g.watch or {}) do
+		ids[#ids + 1] = itemID
+	end
+	if #ids == 0 then
+		return nil, "empty"
+	end
+	table.sort(ids) -- the same watchlist always encodes to the same string
+	local lines = {}
+	for _, itemID in ipairs(ids) do
+		lines[#lines + 1] = ("i %d %d"):format(itemID, g.watch[itemID])
+	end
+	local payload = table.concat(lines, "\n")
+	return ("%s:%x:%s"):format(SHARE_PREFIX, Checksum(payload), Base64Encode(payload)), #ids
+end
+
+-- Returns a list of { itemID, min } sorted by ID, or nil plus a reason
+-- ("empty", "format" or "corrupt").
+function ns.ParseWatchString(text)
+	if type(text) ~= "string" then
+		return nil, "empty"
+	end
+	-- Tolerate a paste that picked up colour codes or line wrapping; no part
+	-- of a valid string contains whitespace.
+	text = text:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("%s+", "")
+	if text == "" then
+		return nil, "empty"
+	end
+	local hex, encoded = text:match("^[Gg][Bb][Ww]1:(%x+):([A-Za-z0-9+/=]+)$")
+	if not hex then
+		return nil, "format"
+	end
+	local payload = Base64Decode(encoded)
+	if not payload or payload == "" then
+		return nil, "format"
+	end
+	if ("%x"):format(Checksum(payload)) ~= hex:lower() then
+		return nil, "corrupt"
+	end
+	local items, seen = {}, {}
+	for line in (payload .. "\n"):gmatch("(.-)\n") do
+		-- Unknown line kinds are skipped so a future format can add fields
+		-- without this version choking on them.
+		local id, minCount = line:match("^i%s+(%d+)%s+(%d+)$")
+		id, minCount = tonumber(id), tonumber(minCount)
+		if id and minCount and id > 0 and minCount >= 1 and not seen[id] then
+			seen[id] = true
+			items[#items + 1] = { itemID = id, min = minCount }
+		end
+	end
+	if #items == 0 then
+		return nil, "format"
+	end
+	table.sort(items, function(a, b) return a.itemID < b.itemID end)
+	return items
+end
+
+-- Dry run for the import preview: how the parsed list compares to what this
+-- guild already tracks.
+function ns.SummarizeWatchImport(items)
+	local g = ns.GetGuildData(false)
+	local watch = (g and g.watch) or {}
+	local summary = { new = 0, changed = 0, same = 0, unknown = 0, existing = 0 }
+	for _, entry in ipairs(items) do
+		if not C_Item.DoesItemExistByID(entry.itemID) then
+			summary.unknown = summary.unknown + 1
+		else
+			local current = watch[entry.itemID]
+			if current == nil then
+				summary.new = summary.new + 1
+			elseif current ~= entry.min then
+				summary.changed = summary.changed + 1
+			else
+				summary.same = summary.same + 1
+			end
+		end
+	end
+	for _ in pairs(watch) do
+		summary.existing = summary.existing + 1
+	end
+	return summary
+end
+
+-- mode "merge" keeps items the string does not mention; "replace" drops them.
+-- Either way the imported minimum wins for items present in both.
+function ns.ApplyWatchImport(items, mode)
+	local g = ns.GetGuildData(true)
+	if not g then
+		ns.Print("You are not in a guild.")
+		return nil
+	end
+	g.watchNames = g.watchNames or {}
+	local result = { added = 0, updated = 0, removed = 0, skipped = 0 }
+	local incoming = {}
+	for _, entry in ipairs(items) do
+		if C_Item.DoesItemExistByID(entry.itemID) then
+			incoming[entry.itemID] = entry.min
+		else
+			result.skipped = result.skipped + 1
+		end
+	end
+	if mode == "replace" then
+		for itemID in pairs(g.watch) do
+			if not incoming[itemID] then
+				g.watch[itemID] = nil
+				g.watchNames[itemID] = nil
+				result.removed = result.removed + 1
+			end
+		end
+	end
+	for itemID, minCount in pairs(incoming) do
+		local current = g.watch[itemID]
+		if current == nil then
+			result.added = result.added + 1
+		elseif current ~= minCount then
+			result.updated = result.updated + 1
+		end
+		g.watch[itemID] = minCount
+		if not g.watchNames[itemID] then
+			local item = Item:CreateFromItemID(itemID)
+			item:ContinueOnItemLoad(function()
+				local data = ns.GetGuildData(false)
+				if data and data.watch[itemID] then
+					data.watchNames = data.watchNames or {}
+					data.watchNames[itemID] = item:GetItemName()
+				end
+				if ns.RefreshUI then ns.RefreshUI() end
+			end)
+		end
+	end
+	return result
 end
 
 -------------------------------------------------------------------------------
