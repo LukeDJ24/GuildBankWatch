@@ -545,6 +545,101 @@ function ns.ApplyWatchImport(items, mode)
 end
 
 -------------------------------------------------------------------------------
+-- Auctionator shopping list
+-------------------------------------------------------------------------------
+-- Auctionator imports lists as "<list name>^<item>^<item>...", one list per
+-- line (its Source/Shopping/ImportExport.lua). An item may be a plain name or
+-- an advanced search: 14 ";"-separated fields, of which we set the first (the
+-- name, quoted to force an exact match) and the last (how many to buy).
+--
+-- Importing onto a list name that already exists replaces its contents, so the
+-- stable name below means repeat exports refresh one list rather than piling
+-- up duplicates.
+
+local SHOPPING_LIST_PREFIX = "GuildBankWatch - "
+
+-- Field order taken from Auctionator.Search.SplitAdvancedSearch. Written out
+-- as a named list rather than a literal so a miscounted ";" is impossible.
+local function AdvancedSearchEntry(name, quantity)
+	local fields = {
+		('"%s"'):format(name), -- query; the quotes are what set isExact
+		"",  -- categoryKey
+		"",  -- minItemLevel
+		"",  -- maxItemLevel
+		"",  -- minLevel
+		"",  -- maxLevel
+		"",  -- minCraftedLevel
+		"",  -- maxCraftedLevel
+		"",  -- minPrice
+		"",  -- maxPrice
+		"",  -- quality
+		"#", -- tier; Auctionator writes "#" when unset
+		"",  -- expansion
+		tostring(quantity),
+	}
+	return table.concat(fields, ";")
+end
+
+-- Tracked items whose last-seen bank count is under their minimum, sorted by
+-- name. Empty when the bank has never been scanned — stock is unknown then,
+-- not low.
+function ns.GetLowStockItems()
+	local low = {}
+	local g = ns.GetGuildData(false)
+	local totals = g and g.snapshot and g.snapshot.totals
+	if not g or not g.watch or not totals then
+		return low
+	end
+	for itemID, minCount in pairs(g.watch) do
+		local have = totals[itemID] or 0
+		if have < minCount then
+			low[#low + 1] = {
+				itemID = itemID,
+				min = minCount,
+				have = have,
+				short = minCount - have,
+				name = g.watchNames and g.watchNames[itemID],
+			}
+		end
+	end
+	table.sort(low, function(a, b)
+		return (a.name or tostring(a.itemID)) < (b.name or tostring(b.itemID))
+	end)
+	return low
+end
+
+-- Returns the import string, the item count and how many were skipped, or nil
+-- plus a reason ("noguild" or "none").
+function ns.BuildShoppingList()
+	local g = ns.GetGuildData(false)
+	if not g then
+		return nil, "noguild"
+	end
+	local low = ns.GetLowStockItems()
+	if #low == 0 then
+		return nil, "none"
+	end
+	local entries, skipped = {}, 0
+	for _, item in ipairs(low) do
+		local name = item.name or C_Item.GetItemInfo(item.itemID)
+		if name then
+			-- "^" and ";" are the two delimiters; a name holding either would
+			-- corrupt the list rather than fail loudly.
+			name = name:gsub("[%^;\r\n]", " ")
+			entries[#entries + 1] = AdvancedSearchEntry(name, item.short)
+		else
+			skipped = skipped + 1
+		end
+	end
+	if #entries == 0 then
+		return nil, "none"
+	end
+	local guild = GetGuildInfo("player") or g.name or "Unknown"
+	local listName = (SHOPPING_LIST_PREFIX .. guild):gsub("[%^\r\n]", " ")
+	return listName .. "^" .. table.concat(entries, "^"), #entries, skipped
+end
+
+-------------------------------------------------------------------------------
 -- Scanner: sequential query state machine
 -------------------------------------------------------------------------------
 -- One step at a time: query, wait for the answering event (with a timeout),

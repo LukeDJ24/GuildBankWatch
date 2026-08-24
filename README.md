@@ -22,6 +22,9 @@ across sessions, with low-stock alerts and CSV export on top.
   item.
 - **Shareable watchlists** — export your tracked items as a copy-paste string
   and import someone else's, with a preview before anything changes.
+- **Auctionator shopping list** — one click turns everything below its
+  minimum into an Auctionator-importable shopping list, with the quantity
+  needed for each item.
 - **CSV export** — an in-game copy-paste window with the full transaction
   history, ready for a spreadsheet.
 - **Live capture** — while the guild bank is open the log is re-scanned
@@ -69,6 +72,7 @@ automatically. Then:
 | `/gbw export` | Open the CSV window (Ctrl+C to copy) |
 | `/gbw export items` | Copy your tracked items as a shareable string |
 | `/gbw import` | Paste a shared tracked-items string |
+| `/gbw shopping` | Copy low-stock items as an Auctionator shopping list |
 | `/gbw purge` | Delete this guild's recorded data |
 | `/gbw version` | Show the installed addon version |
 | `/gbw help` | List commands |
@@ -130,6 +134,36 @@ existing minimum, and how many already match. Then choose:
 
 The string carries a checksum, so a paste that was truncated in transit is
 rejected rather than half-imported.
+
+### Shopping list export (Auctionator)
+
+The **Shopping List** button on the Watchlist view (or `/gbw shopping`) copies
+everything currently below its minimum as a string
+[Auctionator](https://www.curseforge.com/wow/addons/auctionator) can import.
+The button is greyed out whenever nothing is low, so it doubles as an
+"everything is stocked" indicator.
+
+Paste the result into Auctionator's shopping list **Import**. The format is:
+
+```
+GuildBankWatch - Knights of Azeroth^"Copper Ore";;;;;;;;;;;#;;20^"Linen Cloth";;;;;;;;;;;#;;5
+```
+
+Each entry is an Auctionator advanced search: the item name is quoted so it
+searches for an **exact** match rather than anything containing that text, and
+the trailing number is the **quantity needed** — your minimum minus what the
+bank last held — which shows up as the purchase quantity in Auctionator.
+
+The list is named after your guild, and re-importing replaces that same list
+rather than creating duplicates, so you can export again after each bank visit
+and simply re-import.
+
+Two things worth knowing:
+
+- Counts come from the **last bank scan**, not live stock, so export after
+  visiting the bank for current numbers.
+- Items whose names have not loaded yet are skipped, and the export window
+  tells you how many. Reopening the Watchlist view resolves them.
 
 ## Releasing
 

@@ -5,13 +5,14 @@
 local ADDON_NAME, ns = ...
 local TYPE = ns.TYPE
 
-local window, exportFrame, shareFrame, importFrame
+local window, exportFrame, shareFrame, importFrame, shoppingFrame
 local importItems -- parsed contents of the import box, nil until it validates
 local editingWatchRow -- minimum box currently being typed into, if any
 local refreshing = false
 local logView, totalsView, watchView
 local logBox, totalsBox, watchBox
 local nameBox, idBox, minBox
+local shoppingButton
 local currentView = "log"
 local typeFilterIndex = 1
 local nameFilter = ""
@@ -523,12 +524,22 @@ local function CreateWatchView(content)
 	shareButton:SetPoint("RIGHT", importButton, "LEFT", -6, 0)
 	shareButton:SetText("Export")
 	shareButton:SetScript("OnClick", function() ns.OpenWatchExport() end)
+	SetActionTooltip(shareButton, "Copy your tracked items as a string you can share or import elsewhere.")
 
-	local hint = watchView:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	hint:SetPoint("LEFT", addButton, "RIGHT", 14, 0)
-	hint:SetPoint("RIGHT", shareButton, "LEFT", -10, 0)
-	hint:SetJustifyH("LEFT")
-	hint:SetText("IDs come from wowhead.com.")
+	shoppingButton = CreateFrame("Button", nil, watchView, "UIPanelButtonTemplate")
+	shoppingButton:SetSize(130, 22)
+	shoppingButton:SetPoint("RIGHT", shareButton, "LEFT", -6, 0)
+	shoppingButton:SetText("Shopping List")
+	shoppingButton:SetScript("OnClick", function() ns.OpenShoppingExport() end)
+	SetActionTooltip(shoppingButton,
+		"Copy the items below their minimum as an Auctionator shopping list, with the quantity needed for each. Enabled only while something is low.")
+	-- Refresh() turns this on; stay off until a bank scan proves something low.
+	shoppingButton:Disable()
+
+	-- The bottom row has no width left for a hint, so this guidance lives on
+	-- the ID box instead — which fits the fuller version anyway.
+	SetActionTooltip(idBox,
+		"Item IDs come from wowhead.com — the number in the item page URL. You can also shift-click an item link while this view is open.")
 
 	-- Shift-clicked item links land in the ID box while this view is open.
 	if type(ChatEdit_InsertLink) == "function" then
@@ -568,6 +579,7 @@ Refresh = function()
 		local list = BuildWatchList()
 		SetListData(watchBox, list)
 		watchView.empty:SetShown(#list == 0)
+		shoppingButton:SetEnabled(#ns.GetLowStockItems() > 0)
 	end
 	refreshing = false
 end
@@ -792,6 +804,31 @@ function ns.OpenWatchExport()
 	shareFrame.editBox:HighlightText()
 end
 
+function ns.OpenShoppingExport()
+	local text, info, skipped = ns.BuildShoppingList()
+	if not text then
+		if info == "noguild" then
+			ns.Print("You are not in a guild.")
+		else
+			ns.Print("Nothing is below its minimum — no shopping list needed.")
+		end
+		return
+	end
+	if not shoppingFrame then
+		shoppingFrame = CreateTextDialog("GuildBankWatchShoppingFrame",
+			"GuildBankWatch — Auctionator Shopping List", 560, 250)
+	end
+	local hint = ("%d item(s) below minimum — Ctrl+C, then paste into Auctionator's list import."):format(info)
+	if skipped and skipped > 0 then
+		hint = hint .. ("\n|cffff9933%d item(s) skipped: name not loaded yet.|r"):format(skipped)
+	end
+	shoppingFrame.hint:SetText(hint)
+	shoppingFrame.editBox:SetText(text)
+	shoppingFrame:Show()
+	shoppingFrame.editBox:SetFocus()
+	shoppingFrame.editBox:HighlightText()
+end
+
 -- How many currently tracked items a "replace" would drop: everything tracked
 -- now that the pasted string does not mention.
 local function ReplaceDropCount(summary)
@@ -937,6 +974,8 @@ SlashCmdList.GUILDBANKWATCH = function(msg)
 		end
 	elseif lower == "import" then
 		ns.OpenWatchImport()
+	elseif lower == "shopping" then
+		ns.OpenShoppingExport()
 	elseif lower == "track" then
 		local id, minCount = rest:match("^(%d+)%s*(%d*)$")
 		if id then
@@ -961,6 +1000,7 @@ SlashCmdList.GUILDBANKWATCH = function(msg)
 		ns.Print("  /gbw export — open the CSV export window")
 		ns.Print("  /gbw export items — copy your tracked items as a shareable string")
 		ns.Print("  /gbw import — paste a shared tracked-items string")
+		ns.Print("  /gbw shopping — copy low-stock items as an Auctionator shopping list")
 		ns.Print("  /gbw purge — delete this guild's recorded data")
 		ns.Print("  /gbw version — show the installed addon version")
 	else

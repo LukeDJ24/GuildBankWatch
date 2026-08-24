@@ -2,7 +2,7 @@
 ## Title: GuildBankWatch
 ## Notes: Tracks who takes items and gold from the guild bank, with low-stock alerts, shareable watchlists, and CSV export.
 ## Author: Dev
-## Version: 1.2.0
+## Version: 1.3.0
 ## SavedVariables: GuildBankWatchDB
 ## IconTexture: Interface\Icons\INV_Misc_Coin_17
 ## X-Category: Guild
